@@ -1,0 +1,149 @@
+{
+  "rules": [
+    {
+      "carrier": "FEDEX",
+      "rule_type": "AREA_SURCHARGE_ZIPS",
+      "name": "FedEx 2026 delivery/pickup area sample ZIP list",
+      "effective_start": "2026-01-01",
+      "effective_end": null,
+      "source_uri": "sample://fedex/2026-area-surcharge-zips",
+      "payload": {
+        "delivery_area": {
+          "standard": ["59001", "59002", "80435"],
+          "extended": ["99701", "99801"],
+          "remote": ["99501", "99645"]
+        },
+        "pickup_area": {
+          "standard": ["59001", "80435"],
+          "remote": ["99501"]
+        },
+        "amounts": {
+          "DELIVERY_AREA.standard": 5.95,
+          "DELIVERY_AREA.extended": 8.45,
+          "REMOTE_AREA.remote": 16.75,
+          "PICKUP_AREA.standard": 4.75,
+          "PICKUP_AREA.remote": 13.50
+        }
+      }
+    },
+    {
+      "carrier": "UPS",
+      "rule_type": "AREA_SURCHARGE_ZIPS",
+      "name": "UPS 2026 area surcharge sample ZIP list",
+      "effective_start": "2026-01-01",
+      "effective_end": null,
+      "source_uri": "sample://ups/2026-area-surcharge-listing",
+      "payload": {
+        "delivery_area": {
+          "standard": ["59001", "59002", "80435"],
+          "extended": ["99701", "99801"],
+          "remote": ["99501", "99645", "96799"]
+        },
+        "pickup_area": {
+          "standard": [],
+          "remote": []
+        },
+        "amounts": {
+          "DELIVERY_AREA.standard": 6.10,
+          "DELIVERY_AREA.extended": 8.85,
+          "REMOTE_AREA.remote": 17.25
+        }
+      }
+    },
+    {
+      "carrier": "USPS",
+      "rule_type": "AREA_SURCHARGE_ZIPS",
+      "name": "USPS 2026 adjustment sample geography",
+      "effective_start": "2026-01-01",
+      "effective_end": null,
+      "source_uri": "sample://usps/2026-adjustment-zones",
+      "payload": {
+        "delivery_area": {
+          "standard": [],
+          "extended": [],
+          "remote": []
+        },
+        "pickup_area": {
+          "standard": [],
+          "remote": []
+        },
+        "amounts": {}
+      }
+    },
+    {
+      "carrier": "FEDEX",
+      "rule_type": "FUEL_SCHEDULE",
+      "name": "FedEx 2026 sample fuel schedule",
+      "effective_start": "2026-01-01",
+      "effective_end": null,
+      "source_uri": "sample://fedex/2026-fuel",
+      "payload": {
+        "weekly_percentages": [
+          {"start": "2026-01-01", "end": "2026-03-31", "percent": 0.165},
+          {"start": "2026-04-01", "end": "2026-12-31", "percent": 0.1725}
+        ],
+        "rounding": "HALF_UP"
+      }
+    },
+    {
+      "carrier": "UPS",
+      "rule_type": "FUEL_SCHEDULE",
+      "name": "UPS 2026 sample fuel schedule",
+      "effective_start": "2026-01-01",
+      "effective_end": null,
+      "source_uri": "sample://ups/2026-fuel",
+      "payload": {
+        "weekly_percentages": [
+          {"start": "2026-01-01", "end": "2026-03-31", "percent": 0.155},
+          {"start": "2026-04-01", "end": "2026-12-31", "percent": 0.1625}
+        ],
+        "rounding": "HALF_UP"
+      }
+    },
+    {
+      "carrier": "FEDEX",
+      "rule_type": "DIM_WEIGHT",
+      "name": "FedEx 2026 sample dimensional weight divisor",
+      "effective_start": "2026-01-01",
+      "effective_end": null,
+      "source_uri": "sample://fedex/2026-dim-weight",
+      "payload": {"divisor": 139, "round_up_to_lbs": 1}
+    },
+    {
+      "carrier": "UPS",
+      "rule_type": "DIM_WEIGHT",
+      "name": "UPS 2026 sample dimensional weight divisor",
+      "effective_start": "2026-01-01",
+      "effective_end": null,
+      "source_uri": "sample://ups/2026-dim-weight",
+      "payload": {"divisor": 139, "round_up_to_lbs": 1}
+    },
+    {
+      "carrier": "FEDEX",
+      "rule_type": "DISPUTE_POLICY",
+      "name": "FedEx sample rebill window",
+      "effective_start": "2026-01-01",
+      "effective_end": null,
+      "source_uri": "sample://fedex/2026-terms",
+      "payload": {"deadline_days": 180, "auto_dispute_channel": "human_in_loop"}
+    },
+    {
+      "carrier": "UPS",
+      "rule_type": "DISPUTE_POLICY",
+      "name": "UPS sample billing dispute policy",
+      "effective_start": "2026-01-01",
+      "effective_end": null,
+      "source_uri": "sample://ups/2026-terms",
+      "payload": {"deadline_days": 180, "auto_dispute_channel": "human_in_loop"}
+    },
+    {
+      "carrier": "USPS",
+      "rule_type": "DISPUTE_POLICY",
+      "name": "USPS sample adjustment/dispute API policy",
+      "effective_start": "2026-01-01",
+      "effective_end": null,
+      "source_uri": "sample://usps/2026-disputes-api",
+      "payload": {"deadline_days": 60, "auto_dispute_channel": "api"}
+    }
+  ]
+}
