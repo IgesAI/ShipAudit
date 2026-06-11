@@ -194,9 +194,6 @@ class UploadResponse(BaseModel):
     artifact_id: str | None = None
 
 
-    rejected_rows: int
-
-
 class DashboardSummary(BaseModel):
     invoices: int
     invoice_lines: int

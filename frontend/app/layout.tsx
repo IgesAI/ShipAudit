@@ -14,7 +14,11 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en" className={`dark ${geistSans.variable} ${geistMono.variable}`}>
+    <html
+      lang="en"
+      data-scroll-behavior="smooth"
+      className={`dark ${geistSans.variable} ${geistMono.variable}`}
+    >
       <body>
         <AppShell>{children}</AppShell>
       </body>
