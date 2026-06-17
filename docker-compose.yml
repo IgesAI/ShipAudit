@@ -37,7 +37,7 @@ services:
       context: ./backend
     env_file:
       - .env
-    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
     ports:
       - "8000:8000"
     volumes:
@@ -74,6 +74,8 @@ services:
     volumes:
       - ./frontend:/app
       - frontend-node-modules:/app/node_modules
+      # Keep dev .next cache inside Docker so a host `next build` cannot poison `next dev`.
+      - frontend-next-cache:/app/.next
     depends_on:
       backend:
         condition: service_started
@@ -82,3 +84,4 @@ volumes:
   postgres-data:
   minio-data:
   frontend-node-modules:
+  frontend-next-cache:

@@ -6,8 +6,9 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import (
     AccessorialType,
@@ -19,6 +20,14 @@ from app.models import (
     RejectedRow,
     Shipment,
     Tenant,
+)
+from app.services.mappers import MapperError, detect_mapper, get_mapper, mapper_for_hint
+from app.services.mappers.fedex_pdf import map_fedex_pdf
+from app.services.pdf_extraction import (
+    PdfExtraction,
+    PdfExtractionUnavailable,
+    PdfExtractor,
+    default_pdf_extractor,
 )
 from app.services.storage import InMemoryEvidenceStorage
 
@@ -118,8 +127,13 @@ def parse_date(value: str | date) -> date:
     return date.fromisoformat(value.strip())
 
 
-def validate_invoice_row(row: dict[str, Any]) -> list[str]:
-    """Return all hard-fail reasons for one invoice line row."""
+def validate_invoice_row(row: dict[str, Any], allow_other: bool = False) -> list[str]:
+    """Return all hard-fail reasons for one invoice line row.
+
+    ``allow_other`` permits the explicit ``OTHER`` charge code, used by the
+    carrier-export path to capture real-but-unmodelled charges so invoices
+    reconcile. Such lines are never claimed by the audit engine.
+    """
     reasons: list[str] = []
     for fieldname in INVOICE_REQUIRED_FIELDS:
         if not str(row.get(fieldname) or "").strip():
@@ -136,7 +150,8 @@ def validate_invoice_row(row: dict[str, Any]) -> list[str]:
         if pattern and not pattern.match(tracking):
             reasons.append(f"tracking number does not match {carrier.value} format: {tracking}")
     charge_code = str(row.get("charge_code") or "").strip().upper()
-    if charge_code and charge_code not in CHARGE_CODE_MAP:
+    is_other = allow_other and charge_code == AccessorialType.OTHER.value
+    if charge_code and charge_code not in CHARGE_CODE_MAP and not is_other:
         reasons.append(f"unmapped charge code: {charge_code}")
     for date_field in ("invoice_date", "ship_date"):
         raw = str(row.get(date_field) or "").strip()
@@ -231,8 +246,110 @@ class IngestionService:
         self, tenant: Tenant, filename: str, content: bytes, content_type: str = "text/csv"
     ) -> IngestResult:
         artifact = self.store_artifact(tenant.id, "invoice", filename, content, content_type)
-        result = IngestResult(artifact=artifact)
         rows = list(csv.DictReader(io.StringIO(content.decode("utf-8-sig"))))
+        return self._ingest_invoice_rows(
+            tenant, artifact, filename, rows, source_format="csv", allow_other=False
+        )
+
+    def ingest_carrier_export(
+        self,
+        tenant: Tenant,
+        filename: str,
+        content: bytes,
+        carrier_hint: str | None = None,
+        content_type: str = "text/csv",
+    ) -> list[IngestResult]:
+        """Ingest a native carrier billing export (UPS / FedEx CSV).
+
+        The raw export is preserved as one artifact, then translated by the
+        matching mapper into per-invoice canonical rows. Each invoice runs
+        through the same fail-closed pipeline as a hand-built CSV. Returns one
+        :class:`IngestResult` per invoice found (or a single result describing a
+        whole-file rejection).
+        """
+        artifact = self.store_artifact(tenant.id, "carrier_export", filename, content, content_type)
+        try:
+            decoded = content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return [self._whole_file_rejection(tenant, artifact, "carrier_export", "file is not valid UTF-8/CSV text")]
+
+        raw_rows = list(csv.reader(io.StringIO(decoded)))
+        if not raw_rows:
+            return [self._whole_file_rejection(tenant, artifact, "carrier_export", "file contained no data rows")]
+
+        from app.services.mappers.ups_billing_250 import (
+            is_headerless_ups_billing,
+            parse_headerless_ups_billing,
+        )
+
+        if is_headerless_ups_billing(raw_rows):
+            rows = parse_headerless_ups_billing(raw_rows)
+            mapper = get_mapper("ups_billing_csv")
+        else:
+            rows = list(csv.DictReader(io.StringIO(decoded)))
+            if not rows:
+                return [self._whole_file_rejection(tenant, artifact, "carrier_export", "file contained no data rows")]
+            headers = list(rows[0].keys())
+            mapper = mapper_for_hint(carrier_hint) if carrier_hint else None
+            if mapper is None:
+                mapper = detect_mapper(headers)
+
+        if mapper is None:
+            return [
+                self._whole_file_rejection(
+                    tenant,
+                    artifact,
+                    "carrier_export",
+                    "could not recognise this file as a UPS or FedEx billing export; "
+                    "for UPS 250-column billing data, upload the raw export (no header row) "
+                    "or prepend the downloadable header row from Billing Center",
+                )
+            ]
+
+        try:
+            mapped_invoices = mapper.map(rows)
+        except MapperError as exc:
+            return [self._whole_file_rejection(tenant, artifact, "carrier_export", str(exc))]
+
+        if not mapped_invoices:
+            return [
+                self._whole_file_rejection(
+                    tenant, artifact, "carrier_export", "no invoices could be extracted from the export"
+                )
+            ]
+
+        results: list[IngestResult] = []
+        for mapped in mapped_invoices:
+            results.append(
+                self._ingest_invoice_rows(
+                    tenant,
+                    artifact,
+                    filename,
+                    mapped.canonical_rows(),
+                    source_format=mapper.name,
+                    allow_other=True,
+                )
+            )
+        return results
+
+    def _whole_file_rejection(
+        self, tenant: Tenant, artifact: RawArtifact, stage: str, reason: str
+    ) -> IngestResult:
+        result = IngestResult(artifact=artifact)
+        result.rejected_rows.append(self._reject(tenant.id, artifact, stage, None, {}, [reason]))
+        self.db.commit()
+        return result
+
+    def _ingest_invoice_rows(
+        self,
+        tenant: Tenant,
+        artifact: RawArtifact,
+        filename: str,
+        rows: list[dict[str, Any]],
+        source_format: str,
+        allow_other: bool,
+    ) -> IngestResult:
+        result = IngestResult(artifact=artifact)
         if not rows:
             result.rejected_rows.append(
                 self._reject(tenant.id, artifact, "invoice", None, {}, ["file contained no data rows"])
@@ -259,7 +376,7 @@ class IngestionService:
         invoice_number = str(header_row.get("invoice_number") or "").strip()
         valid_rows: list[tuple[int, dict[str, Any]]] = []
         for index, row in enumerate(rows):
-            reasons = validate_invoice_row(row)
+            reasons = validate_invoice_row(row, allow_other=allow_other)
             if str(row.get("invoice_number") or "").strip() != invoice_number:
                 reasons.append(
                     "invoice_number differs from file header invoice; one invoice per file is required"
@@ -299,10 +416,45 @@ class IngestionService:
             return result
 
         first = valid_rows[0][1]
+        carrier = CarrierCode(first["carrier"].strip())
+        existing = self.db.scalar(
+            select(Invoice).where(
+                Invoice.tenant_id == tenant.id,
+                Invoice.carrier == carrier,
+                Invoice.invoice_number == invoice_number,
+            )
+        )
+        if existing is not None:
+            line_count = self.db.scalar(
+                select(func.count())
+                .select_from(InvoiceLine)
+                .where(InvoiceLine.invoice_id == existing.id)
+            ) or 0
+            if existing.source_file_hash == artifact.sha256:
+                result.invoice = existing
+                result.accepted_rows = line_count
+                self.db.commit()
+                return result
+            result.rejected_rows.append(
+                self._reject(
+                    tenant.id,
+                    artifact,
+                    "invoice",
+                    None,
+                    {"invoice_number": invoice_number, "carrier": carrier.value},
+                    [
+                        f"invoice {invoice_number} ({carrier.value}) is already ingested; "
+                        "upload a different invoice or remove the existing one first"
+                    ],
+                )
+            )
+            self.db.commit()
+            return result
+
         invoice = Invoice(
             tenant_id=tenant.id,
             raw_artifact_id=artifact.id,
-            carrier=CarrierCode(first["carrier"].strip()),
+            carrier=carrier,
             invoice_number=invoice_number,
             invoice_date=parse_date(first["invoice_date"]),
             account_number=first["account_number"].strip(),
@@ -322,6 +474,7 @@ class IngestionService:
                 )
             )
             charge_code = row["charge_code"].strip().upper()
+            charge_type = CHARGE_CODE_MAP.get(charge_code, AccessorialType.OTHER)
             line = InvoiceLine(
                 invoice_id=invoice.id,
                 shipment_id=shipment.id if shipment else None,
@@ -333,7 +486,7 @@ class IngestionService:
                 ),
                 zone=str(row.get("zone") or "").strip() or None,
                 charge_code=charge_code,
-                charge_type=CHARGE_CODE_MAP[charge_code],
+                charge_type=charge_type,
                 description=str(row.get("description") or charge_code),
                 amount=money(row["amount"]),
                 origin_zip=str(row.get("origin_zip") or "").strip() or None,
@@ -346,7 +499,7 @@ class IngestionService:
                     "source_filename": filename,
                     "source_sha256": artifact.sha256,
                     "row_index": index,
-                    "format": "csv",
+                    "format": source_format,
                 },
                 raw_data=row,
             )
@@ -423,39 +576,157 @@ class IngestionService:
         filename: str,
         content: bytes,
         ocr_confidence: float | None = None,
+        extractor: PdfExtractor | None = None,
     ) -> tuple[RawArtifact, RejectedRow | None]:
-        """Store a PDF invoice for OCR extraction with a fail-closed gate.
+        """Extract a PDF invoice with Docling behind a fail-closed gate.
 
-        The OCR adapter must report extraction confidence. Below-threshold or
-        unreported confidence rejects the document: it is preserved as evidence
-        but never enters the canonical invoice tables.
+        Confidence is taken from the extractor. Below-threshold or unreported
+        confidence rejects the document: it is preserved as evidence but never
+        enters the canonical invoice tables. Above threshold, extracted candidate
+        rows are stored for **human confirmation** (see ``confirm_pdf_extraction``)
+        and are *not* audited until confirmed.
+
+        ``ocr_confidence`` may be supplied directly (skips extraction) for tests
+        and for callers that run OCR out-of-band.
         """
         artifact = self.store_artifact(tenant.id, "invoice_pdf", filename, content, "application/pdf")
+
+        extraction: PdfExtraction | None = None
+        candidate_rows: list[dict[str, Any]] = []
+        extraction_error: str | None = None
+        if ocr_confidence is None:
+            chosen = extractor or default_pdf_extractor()
+            if chosen is None:
+                extraction_error = "no PDF extraction backend available (install the 'pdf' extra)"
+            else:
+                try:
+                    extraction = chosen.extract(content)
+                    ocr_confidence = extraction.confidence
+                    candidate_rows = self._pdf_candidate_rows(extraction)
+                except PdfExtractionUnavailable as exc:
+                    extraction_error = str(exc)
+                except (ImportError, OSError, RuntimeError) as exc:
+                    extraction_error = f"PDF extraction failed: {exc}"
+
         artifact.metadata_json = {
             **artifact.metadata_json,
-            "ocr_pipeline": ["ocrmypdf", "tesseract", "invoice2data"],
+            "ocr_pipeline": ["docling", "tableformer", "easyocr"],
             "ocr_confidence": ocr_confidence,
             "min_confidence_required": MIN_OCR_CONFIDENCE,
         }
+        if extraction_error:
+            artifact.metadata_json["extraction_error"] = extraction_error
+
         rejection: RejectedRow | None = None
         if ocr_confidence is None or ocr_confidence < MIN_OCR_CONFIDENCE:
             artifact.metadata_json["status"] = "rejected_low_confidence"
+            if extraction_error:
+                reason = f"{extraction_error}; document stored but not compiled"
+            else:
+                shown = "unreported" if ocr_confidence is None else str(ocr_confidence)
+                reason = (
+                    f"OCR confidence {shown} is below the required threshold "
+                    f"{MIN_OCR_CONFIDENCE}; document stored but not compiled"
+                )
             rejection = self._reject(
                 tenant.id,
                 artifact,
                 "invoice_pdf",
                 None,
                 {"filename": filename},
-                [
-                    "OCR confidence "
-                    f"{'unreported' if ocr_confidence is None else ocr_confidence} is below the "
-                    f"required threshold {MIN_OCR_CONFIDENCE}; document stored but not compiled"
-                ],
+                [reason],
             )
         else:
-            artifact.metadata_json["status"] = "ready_for_extraction"
+            extracted_tables = extraction.tables if extraction else []
+            extracted_headers = sorted(
+                {h for table in extracted_tables for h in table.headers if str(h).strip()}
+            )
+            artifact.metadata_json["extracted_table_count"] = len(extracted_tables)
+            artifact.metadata_json["extracted_headers"] = extracted_headers
+            if candidate_rows:
+                artifact.metadata_json["status"] = "awaiting_confirmation"
+            else:
+                artifact.metadata_json["status"] = "unmappable"
+            artifact.metadata_json["candidate_rows"] = candidate_rows
+            artifact.metadata_json["candidate_invoice_count"] = len(
+                {r.get("invoice_number") for r in candidate_rows if r.get("invoice_number")}
+            )
+        flag_modified(artifact, "metadata_json")
         self.db.commit()
         return artifact, rejection
+
+    def _pdf_candidate_rows(self, extraction: PdfExtraction) -> list[dict[str, Any]]:
+        """Best-effort map extracted PDF tables to canonical rows.
+
+        Each table whose header row a carrier mapper recognises is mapped; tables
+        we cannot confidently interpret are left for the human reviewer rather
+        than guessed into the canonical schema.
+        """
+        rows: list[dict[str, Any]] = []
+        for mapped in map_fedex_pdf(extraction):
+            rows.extend(mapped.canonical_rows())
+        if rows:
+            return rows
+
+        for table in extraction.tables:
+            if not table.headers or not table.rows:
+                continue
+            mapper = detect_mapper(table.headers)
+            if mapper is None:
+                continue
+            try:
+                for mapped in mapper.map(table.rows):
+                    rows.extend(mapped.canonical_rows())
+            except MapperError:
+                continue
+        return rows
+
+    def confirm_pdf_extraction(
+        self, tenant: Tenant, artifact_id: str, rows: list[dict[str, Any]] | None = None
+    ) -> list[IngestResult]:
+        """Ingest human-confirmed PDF rows through the fail-closed pipeline.
+
+        ``rows`` lets the reviewer submit corrected canonical rows; when omitted,
+        the stored candidate rows are used as-is. Rows are grouped by invoice and
+        run through the same gates as any other ingestion.
+        """
+        artifact = self.db.get(RawArtifact, artifact_id)
+        if artifact is None or artifact.tenant_id != tenant.id:
+            raise ValueError("artifact not found")
+        if artifact.artifact_type != "invoice_pdf":
+            raise ValueError("artifact is not a PDF invoice")
+
+        confirmed = rows if rows is not None else artifact.metadata_json.get("candidate_rows", [])
+        if not confirmed:
+            return [self._whole_file_rejection(tenant, artifact, "invoice_pdf", "no rows to confirm")]
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in confirmed:
+            grouped.setdefault(str(row.get("invoice_number") or ""), []).append(dict(row))
+
+        results: list[IngestResult] = []
+        for invoice_rows in grouped.values():
+            # Re-apply the per-invoice subtotal so the reconciliation gate runs.
+            if invoice_rows and not str(invoice_rows[0].get("invoice_subtotal") or "").strip():
+                subtotal = sum(
+                    (money(r.get("amount")) for r in invoice_rows if str(r.get("amount") or "").strip()),
+                    Decimal("0.00"),
+                )
+                invoice_rows[0]["invoice_subtotal"] = str(subtotal)
+            results.append(
+                self._ingest_invoice_rows(
+                    tenant,
+                    artifact,
+                    artifact.original_filename,
+                    invoice_rows,
+                    source_format="pdf_docling",
+                    allow_other=True,
+                )
+            )
+        artifact.metadata_json = {**artifact.metadata_json, "status": "confirmed"}
+        flag_modified(artifact, "metadata_json")
+        self.db.commit()
+        return results
 
 
 def _parse_bool(value: Any) -> bool | None:

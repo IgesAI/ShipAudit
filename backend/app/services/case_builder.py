@@ -1,5 +1,6 @@
 from datetime import timedelta
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -17,36 +18,72 @@ from app.services.rule_repository import RuleRepository
 
 DEFAULT_DEADLINE_DAYS = 180
 
-EVIDENCE_TEMPLATE = """CARRIER BILLING DISPUTE — {carrier}
-================================================================
-Invoice:            {invoice_number}
-Invoice date:       {invoice_date}
-Account:            {account_number}
-Tracking:           {tracking_number}
-Charge code:        {charge_code} ({charge_type})
-Ship date:          {ship_date}
-Billed amount:      ${billed_amount}
-Expected amount:    ${expected_amount}
-Claim amount:       ${claim_amount}
-Dispute deadline:   {deadline}
+EVIDENCE_TEMPLATE = """## Carrier billing dispute — {carrier}
 
-FINDING
-{explanation}
+### Shipment & invoice
 
-RULE / CONTRACT SOURCE
-Rule version:       {rule_version}
-Source file:        {rule_source}
-Source hash:        {rule_hash}
+| Field | Value |
+| --- | --- |
+| Invoice | {invoice_number} |
+| Invoice date | {invoice_date} |
+| Account | {account_number} |
+| Tracking | {tracking_number} |
+| Charge | {charge_code} ({charge_type}) |
+| Ship date | {ship_date} |
+| Dispute deadline | {deadline} |
 
-SOURCE DOCUMENT PROVENANCE
-Invoice file hash:  {invoice_hash}
-Line provenance:    {line_provenance}
-Manifest:           {manifest}
+### Amounts
 
-This claim is based exclusively on exact, effective-dated carrier rules,
-contract terms, and the shipper's original manifest records. All source
-documents are preserved immutably and identified by SHA-256 hash.
+| | Amount |
+| --- | --- |
+| Billed | ${billed_amount} |
+| Expected | ${expected_amount} |
+| **Claim** | **${claim_amount}** |
+
+### Finding
+
+> {explanation}
+
+### Rule / contract source
+
+| Field | Value |
+| --- | --- |
+| Rule version | {rule_version} |
+| Source file | {rule_source} |
+| Source hash | {rule_hash} |
+
+### Document provenance
+
+| Field | Value |
+| --- | --- |
+| Invoice file hash | {invoice_hash} |
+| Source file | {provenance_file} |
+| Row index | {provenance_row} |
+| Ingest format | {provenance_format} |
+| Manifest | {manifest} |
+
+All source documents are preserved immutably and identified by SHA-256 hash.
+This claim is based exclusively on effective-dated carrier rules, contract
+terms, and the shipper's original manifest records.
 """
+
+
+def _format_provenance(provenance: dict[str, Any] | None) -> tuple[str, str, str]:
+    if not provenance:
+        return "n/a", "n/a", "n/a"
+    filename = str(provenance.get("source_filename") or "n/a")
+    row = str(provenance.get("row_index") if provenance.get("row_index") is not None else "n/a")
+    fmt = str(provenance.get("format") or "n/a")
+    return filename, row, fmt
+
+
+def _format_manifest(shipment) -> str:
+    if not shipment:
+        return "No manifest match on file"
+    return (
+        f"Shipment `{shipment.id}` · service {shipment.service_code} · "
+        f"ship date {shipment.ship_date}"
+    )
 
 
 class CaseBuilder:
@@ -161,6 +198,7 @@ class CaseBuilder:
         invoice = line.invoice
         shipment = line.shipment
         evidence = finding.evidence or {}
+        provenance_file, provenance_row, provenance_format = _format_provenance(line.provenance)
         return EVIDENCE_TEMPLATE.format(
             carrier=invoice.carrier.value,
             invoice_number=invoice.invoice_number,
@@ -179,14 +217,8 @@ class CaseBuilder:
             rule_source=evidence.get("rule_source_uri") or evidence.get("rate_card_name") or "n/a",
             rule_hash=evidence.get("rule_source_hash") or evidence.get("rate_card_hash") or "n/a",
             invoice_hash=invoice.source_file_hash or "n/a",
-            line_provenance=line.provenance,
-            manifest=(
-                {
-                    "shipment_id": shipment.id,
-                    "service": shipment.service_code,
-                    "ship_date": str(shipment.ship_date),
-                }
-                if shipment
-                else "n/a"
-            ),
+            provenance_file=provenance_file,
+            provenance_row=provenance_row,
+            provenance_format=provenance_format,
+            manifest=_format_manifest(shipment),
         )

@@ -81,6 +81,7 @@ export type InvoiceSummary = {
 
 export type UploadResponse = {
   invoice_id: string | null;
+  invoice_count: number;
   shipment_count: number;
   line_count: number;
   rejected_count: number;
@@ -103,6 +104,19 @@ export type DashboardSummary = {
   latest_findings: Finding[];
 };
 
+async function parseApiError(response: Response): Promise<string> {
+  let detail = `${response.status} ${response.statusText}`;
+  try {
+    const payload = await response.json();
+    if (payload?.detail) {
+      detail = typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail);
+    }
+  } catch {
+    // keep status text
+  }
+  return detail;
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
@@ -113,7 +127,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     cache: "no-store",
   });
   if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText}`);
+    throw new Error(await parseApiError(response));
   }
   return response.json() as Promise<T>;
 }
@@ -122,8 +136,19 @@ export function fetchDashboard() {
   return api<DashboardSummary>("/api/dashboard");
 }
 
-export function fetchFindings() {
-  return api<Finding[]>("/api/findings");
+export type FindingFilters = {
+  verdict?: string;
+  carrier?: string;
+  invoice_id?: string;
+};
+
+export function fetchFindings(filters?: FindingFilters) {
+  const params = new URLSearchParams();
+  if (filters?.verdict) params.set("verdict", filters.verdict);
+  if (filters?.carrier) params.set("carrier", filters.carrier);
+  if (filters?.invoice_id) params.set("invoice_id", filters.invoice_id);
+  const query = params.toString();
+  return api<Finding[]>(`/api/findings${query ? `?${query}` : ""}`);
 }
 
 export function fetchCases() {
@@ -146,26 +171,26 @@ export function fetchRateCards() {
   return api<RateCard[]>("/api/rate-cards");
 }
 
-export function fetchInvoices() {
-  return api<InvoiceSummary[]>("/api/invoices");
+export function fetchInvoices(carrier?: string) {
+  const query = carrier ? `?carrier=${encodeURIComponent(carrier)}` : "";
+  return api<InvoiceSummary[]>(`/api/invoices${query}`);
 }
 
-async function uploadFile<T>(path: string, file: File): Promise<T> {
+export function deleteInvoice(invoiceId: string) {
+  return api<Record<string, number>>(`/api/invoices/${invoiceId}`, { method: "DELETE" });
+}
+
+export function clearRejectedRows() {
+  return api<{ removed: number }>("/api/rejected-rows", { method: "DELETE" });
+}
+
+async function uploadFile<T>(path: string, file: File, query?: Record<string, string>): Promise<T> {
   const body = new FormData();
   body.append("file", file);
-  const response = await fetch(`${API_BASE}${path}`, { method: "POST", body });
+  const search = query ? `?${new URLSearchParams(query).toString()}` : "";
+  const response = await fetch(`${API_BASE}${path}${search}`, { method: "POST", body });
   if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`;
-    try {
-      const payload = await response.json();
-      if (payload?.detail) {
-        detail =
-          typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail);
-      }
-    } catch {
-      // keep status text
-    }
-    throw new Error(detail);
+    throw new Error(await parseApiError(response));
   }
   return response.json() as Promise<T>;
 }
@@ -176,6 +201,40 @@ export function uploadInvoiceFile(file: File) {
 
 export function uploadManifestFile(file: File) {
   return uploadFile<UploadResponse>("/api/ingest/manifests", file);
+}
+
+export type CarrierHint = "UPS" | "FEDEX";
+
+export function uploadCarrierExportFile(file: File, carrier?: CarrierHint) {
+  return uploadFile<UploadResponse>(
+    "/api/ingest/carrier-export",
+    file,
+    carrier ? { carrier } : undefined,
+  );
+}
+
+export type PdfIngestResponse = {
+  artifact_id: string;
+  status: string;
+  ocr_confidence: number | null;
+  min_confidence_required: number | null;
+  rejected: boolean;
+  reason: string | null;
+  candidate_invoice_count: number;
+  candidate_rows: Array<Record<string, string>>;
+  extracted_table_count: number;
+  extracted_headers: string[];
+};
+
+export function uploadPdfInvoiceFile(file: File) {
+  return uploadFile<PdfIngestResponse>("/api/ingest/pdf", file);
+}
+
+export function confirmPdfExtraction(artifactId: string, rows?: Array<Record<string, string>>) {
+  return api<UploadResponse>("/api/ingest/pdf/confirm", {
+    method: "POST",
+    body: JSON.stringify({ artifact_id: artifactId, rows: rows ?? null }),
+  });
 }
 
 export function uploadRateCardFile(file: File) {
@@ -192,4 +251,15 @@ export function auditInvoice(invoiceId: string) {
 
 export function buildCases() {
   return api<Case[]>("/api/cases/build", { method: "POST" });
+}
+
+export function decideCase(caseId: string, approve: boolean, reviewerNotes?: string) {
+  return api<Case>(`/api/cases/${caseId}/decision`, {
+    method: "POST",
+    body: JSON.stringify({ approve, reviewer_notes: reviewerNotes ?? null }),
+  });
+}
+
+export function submitReadyDisputes() {
+  return api<Dispute[]>("/api/disputes/submit-ready", { method: "POST" });
 }

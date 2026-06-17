@@ -1,13 +1,14 @@
 import json
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.database import get_db
 from app.models import (
     AuditVerdict,
+    CarrierCode,
     Case,
     CaseStatus,
     Dispute,
@@ -30,6 +31,8 @@ from app.schemas import (
     DisputeRead,
     FindingRead,
     InvoiceRead,
+    PdfConfirmRequest,
+    PdfIngestResponse,
     RateCardRead,
     RefundLedgerRead,
     RejectedRowRead,
@@ -40,6 +43,7 @@ from app.services.address_normalization import AddressNormalizationService
 from app.services.anomaly import AnomalyDetectionService
 from app.services.audit_engine import DeterministicAuditEngine
 from app.services.case_builder import CaseBuilder
+from app.services.data_cleanup import DataCleanupService
 from app.services.dispute_adapters import DisputeOrchestrator
 from app.services.ingestion import IngestionService
 from app.services.ledger import RefundLedgerService
@@ -85,6 +89,93 @@ async def upload_invoice(
         line_count=result.accepted_rows,
         rejected_count=result.rejected_count,
         artifact_id=result.artifact.id if result.artifact else None,
+    )
+
+
+@router.post("/ingest/carrier-export", response_model=UploadResponse)
+async def upload_carrier_export(
+    file: UploadFile = File(...),
+    carrier: str | None = Query(
+        default=None,
+        description="Optional carrier hint (UPS or FEDEX). If omitted, the format is auto-detected.",
+    ),
+    db: Session = Depends(get_db),
+) -> UploadResponse:
+    tenant = default_tenant(db)
+    content = await file.read()
+    results = IngestionService(db).ingest_carrier_export(
+        tenant,
+        file.filename or "carrier_export.csv",
+        content,
+        carrier_hint=carrier,
+        content_type=file.content_type or "text/csv",
+    )
+    invoice_ids = [r.invoice.id for r in results if r.invoice]
+    artifact = next((r.artifact for r in results if r.artifact), None)
+    return UploadResponse(
+        invoice_id=invoice_ids[0] if invoice_ids else None,
+        invoice_count=len(invoice_ids),
+        line_count=sum(r.accepted_rows for r in results),
+        rejected_count=sum(r.rejected_count for r in results),
+        artifact_id=artifact.id if artifact else None,
+    )
+
+
+@router.post("/ingest/pdf", response_model=PdfIngestResponse)
+async def upload_pdf_invoice(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> PdfIngestResponse:
+    tenant = default_tenant(db)
+    content = await file.read()
+    artifact, rejection = IngestionService(db).ingest_pdf(
+        tenant, file.filename or "invoice.pdf", content
+    )
+    meta = artifact.metadata_json or {}
+    unmappable = meta.get("status") == "unmappable"
+    reason = "; ".join(rejection.failure_reasons) if rejection else None
+    if unmappable and not reason:
+        table_count = int(meta.get("extracted_table_count", 0))
+        headers = list(meta.get("extracted_headers", []))
+        header_hint = f" Columns found: {', '.join(headers[:8])}." if headers else ""
+        reason = (
+            f"OCR read the PDF ({meta.get('ocr_confidence')}) but found {table_count} table(s) "
+            f"that do not match UPS/FedEx billing export headers.{header_hint} "
+            "Download the CSV from UPS Billing Center or FedEx Billing Online instead."
+        )
+    return PdfIngestResponse(
+        artifact_id=artifact.id,
+        status=str(meta.get("status", "unknown")),
+        ocr_confidence=meta.get("ocr_confidence"),
+        min_confidence_required=meta.get("min_confidence_required"),
+        rejected=rejection is not None or unmappable,
+        reason=reason,
+        candidate_invoice_count=int(meta.get("candidate_invoice_count", 0)),
+        candidate_rows=list(meta.get("candidate_rows", [])),
+        extracted_table_count=int(meta.get("extracted_table_count", 0)),
+        extracted_headers=list(meta.get("extracted_headers", [])),
+    )
+
+
+@router.post("/ingest/pdf/confirm", response_model=UploadResponse)
+async def confirm_pdf_invoice(
+    payload: PdfConfirmRequest,
+    db: Session = Depends(get_db),
+) -> UploadResponse:
+    tenant = default_tenant(db)
+    try:
+        results = IngestionService(db).confirm_pdf_extraction(
+            tenant, payload.artifact_id, payload.rows
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    invoice_ids = [r.invoice.id for r in results if r.invoice]
+    return UploadResponse(
+        invoice_id=invoice_ids[0] if invoice_ids else None,
+        invoice_count=len(invoice_ids),
+        line_count=sum(r.accepted_rows for r in results),
+        rejected_count=sum(r.rejected_count for r in results),
+        artifact_id=payload.artifact_id,
     )
 
 
@@ -150,6 +241,22 @@ def list_rejected_rows(db: Session = Depends(get_db)) -> list[RejectedRow]:
     )
 
 
+@router.delete("/invoices/{invoice_id}")
+def delete_invoice(invoice_id: str, db: Session = Depends(get_db)) -> dict[str, int]:
+    tenant = default_tenant(db)
+    try:
+        return DataCleanupService(db).delete_invoice(tenant.id, invoice_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.delete("/rejected-rows")
+def clear_rejected_rows(db: Session = Depends(get_db)) -> dict[str, int]:
+    tenant = default_tenant(db)
+    removed = DataCleanupService(db).clear_rejected_rows(tenant.id)
+    return {"removed": removed}
+
+
 @router.post("/audit/invoices/{invoice_id}", response_model=list[FindingRead])
 def audit_invoice(invoice_id: str, db: Session = Depends(get_db)) -> list[Finding]:
     invoice = db.get(Invoice, invoice_id)
@@ -169,7 +276,10 @@ def build_cases(db: Session = Depends(get_db)) -> list[Case]:
 
 @router.post("/cases/{case_id}/decision", response_model=CaseRead)
 def decide_case(case_id: str, decision: CaseDecision, db: Session = Depends(get_db)) -> Case:
-    return DisputeOrchestrator(db).approve_case(case_id, decision.approve, decision.reviewer_notes)
+    try:
+        return DisputeOrchestrator(db).approve_case(case_id, decision.approve, decision.reviewer_notes)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.post("/disputes/submit-ready", response_model=list[DisputeRead])
@@ -181,16 +291,20 @@ def submit_ready(db: Session = Depends(get_db)) -> list[Dispute]:
 
 
 @router.get("/invoices", response_model=list[InvoiceRead])
-def list_invoices(db: Session = Depends(get_db)) -> list[Invoice]:
+def list_invoices(
+    carrier: CarrierCode | None = None,
+    db: Session = Depends(get_db),
+) -> list[Invoice]:
     tenant = default_tenant(db)
-    return list(
-        db.scalars(
-            select(Invoice)
-            .where(Invoice.tenant_id == tenant.id)
-            .options(selectinload(Invoice.lines))
-            .order_by(Invoice.invoice_date.desc())
-        )
+    query = (
+        select(Invoice)
+        .where(Invoice.tenant_id == tenant.id)
+        .options(selectinload(Invoice.lines))
+        .order_by(Invoice.invoice_date.desc())
     )
+    if carrier is not None:
+        query = query.where(Invoice.carrier == carrier)
+    return list(db.scalars(query))
 
 
 @router.get("/shipments", response_model=list[ShipmentRead])
@@ -207,11 +321,24 @@ def list_shipments(db: Session = Depends(get_db)) -> list[Shipment]:
 
 
 @router.get("/findings", response_model=list[FindingRead])
-def list_findings(verdict: AuditVerdict | None = None, db: Session = Depends(get_db)) -> list[Finding]:
+def list_findings(
+    verdict: AuditVerdict | None = None,
+    carrier: CarrierCode | None = None,
+    invoice_id: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[Finding]:
     tenant = default_tenant(db)
     query = select(Finding).where(Finding.tenant_id == tenant.id)
     if verdict is not None:
         query = query.where(Finding.verdict == verdict)
+    if carrier is not None or invoice_id is not None:
+        query = query.join(InvoiceLine, Finding.invoice_line_id == InvoiceLine.id).join(
+            Invoice, InvoiceLine.invoice_id == Invoice.id
+        )
+        if carrier is not None:
+            query = query.where(Invoice.carrier == carrier)
+        if invoice_id is not None:
+            query = query.where(Invoice.id == invoice_id)
     return list(db.scalars(query.order_by(Finding.created_at.desc()).limit(200)))
 
 

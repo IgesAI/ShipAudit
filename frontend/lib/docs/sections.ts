@@ -115,6 +115,74 @@ subtotal_reconciliation: header $1,240.00 vs lines $1,239.92 (delta $0.08)
 `,
   },
   {
+    id: "carrier-formats",
+    title: "Carrier File Formats",
+    subtitle: "How real UPS, FedEx, and USPS billing data arrives — and how to load it",
+    icon: "layers",
+    content: `
+## How invoices actually arrive
+
+Carriers do not ship one tidy format. The same invoice is usually available several ways, and which one you get depends on how the account was set up.
+
+### UPS — UPS Billing Center
+| Format | Notes |
+|--------|-------|
+| **PDF** | Human-readable invoice (what most people see first). |
+| **250-column CSV** | Full "UPS Billing Data File". Ships **without a header row** — ShipAudit auto-detects the raw export, or you can download the header row from Billing Center → Help & Support and prepend it. |
+| **32-column summary CSV** | Same charges, far easier to work with. Recommended. |
+| **XML** | Structured data file. |
+
+UPS billing data is **already one row per charge** (long format): each row repeats the tracking number, service, and dates, plus a charge description and net amount.
+
+### FedEx — FedEx Billing Online (FBO)
+| Format | Notes |
+|--------|-------|
+| **PDF** | Emailed or downloaded invoice. |
+| **Selectable CSV** | You choose which columns and what order, with or without headers. **Wide format** — one row per tracking number with each charge in its own column. |
+| **XLSX / TXT / XML** | Other structured exports. |
+| **EDI (X12 210)** | For automated freight/LTL pipelines. |
+
+### USPS
+USPS rarely sends a per-parcel "invoice". Postage is drawn from an **EPS** account, and shipment data comes from **Informed Visibility / Business Customer Gateway** transaction reports (CSV/Excel), or from a reseller (Stamps.com, Pitney Bowes, EasyPost, Shippo) — each with its own CSV export.
+
+## Uploading a carrier export
+
+Use **Upload & Audit → Step 3 — Carrier billing export** and drop the UPS or FedEx CSV in as-is. ShipAudit:
+
+1. **Detects the format** (or you pick UPS / FedEx explicitly).
+2. **Maps columns** by name — robust to FedEx's configurable column order.
+3. **Translates charge descriptions** into canonical charge types.
+4. **Splits a multi-invoice export** into one invoice per invoice number, each running through the same fail-closed pipeline.
+
+### Charges we don't model are kept, not guessed
+
+Real invoices carry dozens of charge types (additional handling, large package, signature, peak/demand surcharges). Charges ShipAudit doesn't audit are captured as \`OTHER\` so invoice totals reconcile — but they are **never turned into a dispute claim**. You keep a complete, balanced invoice without the system inventing findings.
+
+### Per-shipment reconciliation
+
+For FedEx (wide) files, each shipment's recognized charges plus a balancing \`OTHER\` line must equal the shipment's stated **net charge**. If they don't, the invoice **fails closed** rather than loading a mismatched total.
+
+## PDFs (live)
+
+PDF extraction is inherently probabilistic, so it runs through an **OCR confidence gate** (powered by Docling): anything below threshold is stored as evidence but **rejected**, never silently parsed. High-confidence extractions are surfaced in a **review table for you to confirm** before anything enters the audit — nothing is disputed off an unconfirmed OCR read.
+
+Use **Upload & Audit → PDF invoice (OCR + confirm)**. If the layout can't be confidently mapped, download the **CSV / Excel** version from your carrier portal instead — it's faster and exact.
+
+## The canonical schema
+
+Every path (carrier export, PDF, hand-built CSV) normalizes to the same one-row-per-charge schema. The **Advanced — canonical CSV** uploader accepts this directly:
+
+\`\`\`
+carrier, invoice_number, invoice_date, account_number,
+tracking_number, service_code, ship_date, charge_code, amount
+\`\`\`
+
+Plus optional: \`billing_period, currency, zone, delivery_date,
+origin_zip, destination_zip, billed_weight_lbs, billed_length_in,
+billed_width_in, billed_height_in\`. The **first row** of each invoice carries \`invoice_subtotal\` for the reconciliation gate.
+`,
+  },
+  {
     id: "rate-cards",
     title: "Rate Cards & Contracts",
     subtitle: "Effective-dated contract rates with hard-fail validation",
@@ -400,7 +468,3 @@ curl http://localhost:8000/api/rejected-rows
 `,
   },
 ];
-
-export function getDocSection(id: string): DocSection | undefined {
-  return DOC_SECTIONS.find((s) => s.id === id);
-}

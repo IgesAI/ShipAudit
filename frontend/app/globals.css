@@ -196,6 +196,11 @@ pre {
   color: var(--muted-foreground);
 }
 
+/* Evidence fact sheets — readable prose, not code blocks */
+.evidence-facts dd {
+  word-break: break-word;
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar {
   width: 8px;

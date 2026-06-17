@@ -188,10 +188,29 @@ class RefundLedgerRead(OrmModel):
 
 class UploadResponse(BaseModel):
     invoice_id: str | None = None
+    invoice_count: int = 0
     shipment_count: int = 0
     line_count: int = 0
     rejected_count: int = 0
     artifact_id: str | None = None
+
+
+class PdfIngestResponse(BaseModel):
+    artifact_id: str
+    status: str
+    ocr_confidence: float | None = None
+    min_confidence_required: float | None = None
+    rejected: bool = False
+    reason: str | None = None
+    candidate_invoice_count: int = 0
+    candidate_rows: list[dict[str, Any]] = Field(default_factory=list)
+    extracted_table_count: int = 0
+    extracted_headers: list[str] = Field(default_factory=list)
+
+
+class PdfConfirmRequest(BaseModel):
+    artifact_id: str
+    rows: list[dict[str, Any]] | None = None
 
 
 class DashboardSummary(BaseModel):

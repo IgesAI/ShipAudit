@@ -34,6 +34,9 @@ dev = [
   "pytest-cov>=5.0",
   "ruff>=0.6",
 ]
+pdf = [
+  "docling>=2.97",
+]
 
 [tool.ruff]
 line-length = 100

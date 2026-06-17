@@ -51,7 +51,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
       <div className="relative z-10 mx-auto flex min-h-screen max-w-7xl flex-col gap-6 p-4 md:p-6">
         <nav className="shell-nav glass-strong flex flex-col gap-4 rounded-2xl px-5 py-4 md:flex-row md:items-center md:justify-between">
-          <div className="flex items-center gap-3">
+          <Link href="/" className="flex items-center gap-3 transition hover:opacity-90">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary/20 ring-1 ring-primary/40">
               <span className="text-lg font-bold text-primary">S</span>
             </div>
@@ -59,7 +59,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <p className="text-base font-semibold tracking-tight">ShipAudit</p>
               <p className="text-xs text-muted-foreground">Fail-closed parcel invoice audit</p>
             </div>
-          </div>
+          </Link>
 
           <div className="flex gap-2">
             {NAV_ITEMS.map(({ href, label, icon: Icon }) => {

@@ -4,7 +4,7 @@ import { useGSAP } from "@gsap/react";
 import gsap from "gsap";
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { AlertTriangle, CheckCircle2, RefreshCw, ShieldX, UploadCloud } from "lucide-react";
+import { AlertTriangle, CheckCircle2, RefreshCw, ShieldX, Trash2, UploadCloud } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -18,33 +18,38 @@ import {
 import {
   Case,
   Dispute,
+  clearRejectedRows,
+  deleteInvoice,
+  decideCase,
   fetchCases,
   fetchDashboard,
   fetchDisputes,
   fetchFindings,
+  fetchInvoices,
   fetchRefunds,
   fetchRejectedRows,
+  submitReadyDisputes,
   Finding,
+  type FindingFilters,
+  InvoiceSummary,
   Refund,
   RejectedRow,
   type DashboardSummary,
 } from "@/lib/api";
-import { money } from "@/lib/utils";
+import { cn, money } from "@/lib/utils";
+import { EvidenceViewer, type EvidenceSelection } from "@/components/dashboard/evidence-viewer";
 
-type EvidenceView =
-  | { kind: "json"; data: Record<string, unknown> }
-  | { kind: "document"; text: string };
-
-async function fetchAllData() {
-  const [summary, findings, cases, disputes, refunds, rejectedRows] = await Promise.all([
+async function fetchAllData(findingFilters?: FindingFilters) {
+  const [summary, findings, cases, disputes, refunds, rejectedRows, invoices] = await Promise.all([
     fetchDashboard(),
-    fetchFindings(),
+    fetchFindings(findingFilters),
     fetchCases(),
     fetchDisputes(),
     fetchRefunds(),
     fetchRejectedRows(),
+    fetchInvoices(),
   ]);
-  return { summary, findings, cases, disputes, refunds, rejectedRows };
+  return { summary, findings, cases, disputes, refunds, rejectedRows, invoices };
 }
 
 export function DashboardView() {
@@ -55,8 +60,16 @@ export function DashboardView() {
   const [disputes, setDisputes] = useState<Dispute[]>([]);
   const [refunds, setRefunds] = useState<Refund[]>([]);
   const [rejectedRows, setRejectedRows] = useState<RejectedRow[]>([]);
-  const [selectedEvidence, setSelectedEvidence] = useState<EvidenceView | null>(null);
+  const [invoices, setInvoices] = useState<InvoiceSummary[]>([]);
+  const [findingFilters, setFindingFilters] = useState<FindingFilters>({});
+  const [selectedEvidence, setSelectedEvidence] = useState<EvidenceSelection | null>(null);
   const [loading, setLoading] = useState(true);
+  const [clearingRejected, setClearingRejected] = useState(false);
+  const [submittingDisputes, setSubmittingDisputes] = useState(false);
+  const [decidingCaseId, setDecidingCaseId] = useState<string | null>(null);
+  const [deletingInvoiceId, setDeletingInvoiceId] = useState<string | null>(null);
+  const [workflowMessage, setWorkflowMessage] = useState<string | null>(null);
+  const evidenceRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
 
   const applyData = useCallback((data: Awaited<ReturnType<typeof fetchAllData>>) => {
@@ -66,23 +79,27 @@ export function DashboardView() {
     setDisputes(data.disputes);
     setRefunds(data.refunds);
     setRejectedRows(data.rejectedRows);
+    setInvoices(data.invoices);
   }, []);
 
-  async function refresh() {
-    setLoading(true);
-    setError(null);
-    try {
-      applyData(await fetchAllData());
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to load dashboard");
-    } finally {
-      setLoading(false);
-    }
-  }
+  const refresh = useCallback(
+    async (filters?: FindingFilters) => {
+      setLoading(true);
+      setError(null);
+      try {
+        applyData(await fetchAllData(filters ?? findingFilters));
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Unable to load dashboard");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [applyData, findingFilters],
+  );
 
   useEffect(() => {
     let cancelled = false;
-    fetchAllData()
+    fetchAllData(findingFilters)
       .then((data) => {
         if (!cancelled) applyData(data);
       })
@@ -95,7 +112,81 @@ export function DashboardView() {
     return () => {
       cancelled = true;
     };
-  }, [applyData]);
+  }, [applyData, findingFilters]);
+
+  useEffect(() => {
+    if (selectedEvidence && evidenceRef.current) {
+      evidenceRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, [selectedEvidence]);
+
+  async function handleSubmitDisputes() {
+    setSubmittingDisputes(true);
+    setWorkflowMessage(null);
+    try {
+      const submitted = await submitReadyDisputes();
+      setWorkflowMessage(
+        submitted.length
+          ? `Submitted ${submitted.length} dispute${submitted.length === 1 ? "" : "s"}.`
+          : "No approved or auto-eligible cases ready to submit.",
+      );
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to submit disputes");
+    } finally {
+      setSubmittingDisputes(false);
+    }
+  }
+
+  async function handleCaseDecision(caseId: string, approve: boolean) {
+    setDecidingCaseId(caseId);
+    setWorkflowMessage(null);
+    try {
+      await decideCase(caseId, approve);
+      setWorkflowMessage(approve ? "Case approved for submission." : "Case closed.");
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to update case");
+    } finally {
+      setDecidingCaseId(null);
+    }
+  }
+
+  async function handleDeleteInvoice(invoiceId: string, invoiceNumber: string) {
+    if (
+      !window.confirm(
+        `Delete invoice ${invoiceNumber} and all its findings and dispute cases? This cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+    setDeletingInvoiceId(invoiceId);
+    setError(null);
+    try {
+      const removed = await deleteInvoice(invoiceId);
+      setWorkflowMessage(
+        `Removed ${invoiceNumber} (${removed.findings ?? 0} findings, ${removed.cases ?? 0} cases cleared).`,
+      );
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to delete invoice");
+    } finally {
+      setDeletingInvoiceId(null);
+    }
+  }
+
+  async function handleClearRejectedRows() {
+    if (!window.confirm("Clear all rejected upload rows for this workspace?")) return;
+    setClearingRejected(true);
+    try {
+      await clearRejectedRows();
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to clear rejected rows");
+    } finally {
+      setClearingRejected(false);
+    }
+  }
 
   useGSAP(
     () => {
@@ -134,19 +225,19 @@ export function DashboardView() {
           <p className="mt-2 max-w-2xl text-sm leading-relaxed text-muted-foreground">
             Fail-closed parcel invoice compiler — prove overbilling against effective-dated carrier rules
             and contracts, or refuse to act. Bring real data via{" "}
-            <a href="/upload" className="text-primary underline-offset-2 hover:underline">
+            <Link href="/upload" className="text-primary underline-offset-2 hover:underline">
               Upload & Audit
-            </a>
+            </Link>
             , or see{" "}
-            <a href="/docs" className="text-primary underline-offset-2 hover:underline">
+            <Link href="/docs" className="text-primary underline-offset-2 hover:underline">
               Docs & Tutorial
-            </a>{" "}
+            </Link>{" "}
             for the full explanation.
           </p>
         </div>
         <div className="flex gap-3">
-          <Button variant="secondary" onClick={refresh} disabled={loading}>
-            <RefreshCw className="mr-2 h-4 w-4" />
+          <Button variant="secondary" onClick={() => refresh()} disabled={loading}>
+            <RefreshCw className={cn("mr-2 h-4 w-4", loading && "animate-spin")} />
             Refresh
           </Button>
           <Link
@@ -195,15 +286,121 @@ export function DashboardView() {
         />
       </section>
 
-      <section className="grid gap-6 xl:grid-cols-[2fr_1fr]">
+      {invoices.length ? (
         <GlassCard className="dash-panel">
           <GlassCardHeader>
-            <GlassCardTitle>Latest Findings</GlassCardTitle>
+            <GlassCardTitle>Your invoices</GlassCardTitle>
             <GlassCardDescription>
-              Every line resolves to PASS, FAIL (missing source), DISCREPANCY, REVIEW, or NO CLAIM.
+              Remove old test data here. Deleting an invoice also removes its charge lines, findings,
+              and dispute cases.
             </GlassCardDescription>
           </GlassCardHeader>
           <GlassCardContent>
+            <div className="divide-y divide-white/8 rounded-lg border border-white/10">
+              {invoices.map((invoice) => (
+                <div
+                  key={invoice.id}
+                  className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"
+                >
+                  <div>
+                    <div className="font-medium">
+                      {invoice.carrier} {invoice.invoice_number}
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      {invoice.invoice_date} · {money(invoice.total_amount)}
+                    </div>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    className="h-8 text-red-300 hover:bg-red-500/10 hover:text-red-200"
+                    disabled={deletingInvoiceId !== null}
+                    onClick={() => handleDeleteInvoice(invoice.id, invoice.invoice_number)}
+                  >
+                    {deletingInvoiceId === invoice.id ? (
+                      <RefreshCw className="mr-2 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Trash2 className="mr-2 h-3.5 w-3.5" />
+                    )}
+                    Delete
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </GlassCardContent>
+        </GlassCard>
+      ) : null}
+
+      <section className="grid gap-6 xl:grid-cols-[2fr_1fr]">
+        <GlassCard className="dash-panel">
+          <GlassCardHeader>
+            <GlassCardTitle>Findings</GlassCardTitle>
+            <GlassCardDescription>
+              Filter by verdict, carrier, or invoice. Every line resolves to PASS, FAIL, DISCREPANCY,
+              REVIEW, or NO CLAIM.
+            </GlassCardDescription>
+          </GlassCardHeader>
+          <GlassCardContent>
+            <div className="mb-4 flex flex-wrap items-end gap-3">
+              <FilterSelect
+                label="Verdict"
+                value={findingFilters.verdict ?? ""}
+                onChange={(verdict) =>
+                  setFindingFilters((prev) => ({
+                    ...prev,
+                    verdict: verdict || undefined,
+                  }))
+                }
+                options={[
+                  ["", "All verdicts"],
+                  ["DISCREPANCY", "Discrepancy"],
+                  ["FAIL_MISSING_SOURCE", "Missing source"],
+                  ["PASS", "Pass"],
+                  ["REVIEW", "Review"],
+                  ["NO_CLAIM", "No claim"],
+                ]}
+              />
+              <FilterSelect
+                label="Carrier"
+                value={findingFilters.carrier ?? ""}
+                onChange={(carrier) =>
+                  setFindingFilters((prev) => ({
+                    ...prev,
+                    carrier: carrier || undefined,
+                  }))
+                }
+                options={[
+                  ["", "All carriers"],
+                  ["UPS", "UPS"],
+                  ["FEDEX", "FedEx"],
+                  ["USPS", "USPS"],
+                ]}
+              />
+              <FilterSelect
+                label="Invoice"
+                value={findingFilters.invoice_id ?? ""}
+                onChange={(invoice_id) =>
+                  setFindingFilters((prev) => ({
+                    ...prev,
+                    invoice_id: invoice_id || undefined,
+                  }))
+                }
+                options={[
+                  ["", "All invoices"],
+                  ...invoices.map(
+                    (inv) => [inv.id, `${inv.carrier} ${inv.invoice_number}`] as [string, string],
+                  ),
+                ]}
+              />
+              {(findingFilters.verdict || findingFilters.carrier || findingFilters.invoice_id) && (
+                <Button
+                  variant="ghost"
+                  className="h-9 text-xs"
+                  onClick={() => setFindingFilters({})}
+                >
+                  Clear filters
+                </Button>
+              )}
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full text-left text-sm">
                 <thead className="text-xs uppercase text-muted-foreground">
@@ -217,7 +414,7 @@ export function DashboardView() {
                   </tr>
                 </thead>
                 <tbody>
-                  {findings.slice(0, 14).map((finding) => (
+                  {findings.map((finding) => (
                     <tr key={finding.id} className="border-b border-white/5 last:border-b-0">
                       <td className="py-3">
                         <div className="font-medium">{finding.finding_type}</div>
@@ -233,7 +430,7 @@ export function DashboardView() {
                         <Button
                           variant="ghost"
                           className="h-8 px-2"
-                          onClick={() => setSelectedEvidence({ kind: "json", data: finding.evidence })}
+                          onClick={() => setSelectedEvidence({ kind: "finding", finding })}
                         >
                           View
                         </Button>
@@ -243,6 +440,9 @@ export function DashboardView() {
                 </tbody>
               </table>
             </div>
+            {!findings.length ? (
+              <p className="mt-3 text-sm text-muted-foreground">No findings match the current filters.</p>
+            ) : null}
           </GlassCardContent>
         </GlassCard>
 
@@ -294,13 +494,27 @@ export function DashboardView() {
       <section className="grid gap-6 xl:grid-cols-2">
         <GlassCard className="dash-panel">
           <GlassCardHeader>
-            <div className="flex items-center gap-2">
-              <ShieldX className="h-4 w-4 text-red-300" />
-              <GlassCardTitle>Rejected Rows</GlassCardTitle>
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <ShieldX className="h-4 w-4 text-red-300" />
+                  <GlassCardTitle>Rejected Rows</GlassCardTitle>
+                </div>
+                <GlassCardDescription>
+                  Inputs that failed required-field, format, or reconciliation gates. Nothing here was guessed at.
+                </GlassCardDescription>
+              </div>
+              {rejectedRows.length ? (
+                <Button
+                  variant="secondary"
+                  className="h-8 shrink-0 text-xs"
+                  disabled={clearingRejected}
+                  onClick={handleClearRejectedRows}
+                >
+                  Clear all
+                </Button>
+              ) : null}
             </div>
-            <GlassCardDescription>
-              Inputs that failed required-field, format, or reconciliation gates. Nothing here was guessed at.
-            </GlassCardDescription>
           </GlassCardHeader>
           <GlassCardContent className="space-y-3">
             {rejectedRows.slice(0, 8).map((row) => (
@@ -325,33 +539,86 @@ export function DashboardView() {
 
         <GlassCard className="dash-panel">
           <GlassCardHeader>
-            <GlassCardTitle>Dispute Cases</GlassCardTitle>
-            <GlassCardDescription>Built from proven discrepancies only, with filing deadlines.</GlassCardDescription>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <GlassCardTitle>Dispute Cases</GlassCardTitle>
+                <GlassCardDescription>
+                  Approve cases for submission, then submit ready disputes from the action below.
+                </GlassCardDescription>
+              </div>
+              <Button
+                variant="secondary"
+                className="h-8 shrink-0 text-xs"
+                disabled={submittingDisputes || !cases.length}
+                onClick={handleSubmitDisputes}
+              >
+                {submittingDisputes ? (
+                  <RefreshCw className="mr-2 h-3.5 w-3.5 animate-spin" />
+                ) : null}
+                Submit ready disputes
+              </Button>
+            </div>
           </GlassCardHeader>
           <GlassCardContent className="space-y-3">
-            {cases.slice(0, 8).map((item) => (
-              <div key={item.id} className="rounded-lg border border-white/10 bg-white/[0.03] p-3">
-                <div className="flex items-center justify-between gap-3">
-                  <span className="min-w-0 truncate text-sm font-medium">{item.title}</span>
-                  <StatusBadge status={item.status} />
-                </div>
-                <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
-                  <span>Deadline: {item.dispute_deadline ?? "n/a"}</span>
-                  {item.evidence_document ? (
+            {workflowMessage ? (
+              <p className="rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs text-primary">
+                {workflowMessage}
+              </p>
+            ) : null}
+            {cases.slice(0, 8).map((item) => {
+              const reviewable =
+                item.status === "NEEDS_REVIEW" || item.status === "READY_FOR_AUTO_DISPUTE";
+              return (
+                <div key={item.id} className="rounded-lg border border-white/10 bg-white/[0.03] p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="min-w-0 truncate text-sm font-medium">{item.title}</span>
+                    <StatusBadge status={item.status} />
+                  </div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    Deadline: {item.dispute_deadline ?? "n/a"}
+                    {item.auto_dispute_eligible ? " · auto-eligible" : ""}
+                  </div>
+                  <div className="mt-2 flex flex-wrap items-center justify-end gap-1">
+                    {reviewable ? (
+                      <>
+                        <Button
+                          variant="ghost"
+                          className="h-7 px-2 text-xs text-emerald-300"
+                          disabled={decidingCaseId !== null}
+                          onClick={() => handleCaseDecision(item.id, true)}
+                        >
+                          Approve
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          className="h-7 px-2 text-xs text-red-300"
+                          disabled={decidingCaseId !== null}
+                          onClick={() => handleCaseDecision(item.id, false)}
+                        >
+                          Reject
+                        </Button>
+                      </>
+                    ) : null}
                     <Button
                       variant="ghost"
                       className="h-7 px-2 text-xs"
-                      onClick={() =>
-                        setSelectedEvidence({ kind: "document", text: item.evidence_document ?? "" })
-                      }
+                      onClick={() => setSelectedEvidence({ kind: "case", item })}
                     >
-                      Evidence packet
+                      View evidence
                     </Button>
-                  ) : null}
+                  </div>
                 </div>
-              </div>
-            ))}
-            {!cases.length ? <p className="text-sm text-muted-foreground">No cases yet.</p> : null}
+              );
+            })}
+            {!cases.length ? (
+              <p className="text-sm text-muted-foreground">
+                No cases yet.{" "}
+                <Link href="/upload" className="text-primary underline-offset-2 hover:underline">
+                  Build cases on Upload & Audit
+                </Link>
+                .
+              </p>
+            ) : null}
           </GlassCardContent>
         </GlassCard>
       </section>
@@ -374,30 +641,9 @@ export function DashboardView() {
       </section>
 
       {selectedEvidence ? (
-        <GlassCard className="dash-panel">
-          <GlassCardHeader>
-            <div className="flex items-center justify-between">
-              <div>
-                <GlassCardTitle>
-                  {selectedEvidence.kind === "document" ? "Dispute Evidence Document" : "Evidence Packet"}
-                </GlassCardTitle>
-                <GlassCardDescription>
-                  Versioned, hash-identified dispute support data for the selected item.
-                </GlassCardDescription>
-              </div>
-              <Button variant="secondary" onClick={() => setSelectedEvidence(null)}>
-                Close
-              </Button>
-            </div>
-          </GlassCardHeader>
-          <GlassCardContent>
-            <pre className="max-h-96 overflow-auto rounded-lg border border-white/10 bg-black/40 p-4 text-xs text-zinc-200">
-              {selectedEvidence.kind === "document"
-                ? selectedEvidence.text
-                : JSON.stringify(selectedEvidence.data, null, 2)}
-            </pre>
-          </GlassCardContent>
-        </GlassCard>
+        <div ref={evidenceRef}>
+          <EvidenceViewer selection={selectedEvidence} onClose={() => setSelectedEvidence(null)} />
+        </div>
       ) : null}
     </div>
   );
@@ -450,6 +696,35 @@ function StatusBadge({ status }: { status: string }) {
         ? "warning"
         : "secondary";
   return <Badge variant={variant}>{status}</Badge>;
+}
+
+function FilterSelect({
+  label,
+  value,
+  onChange,
+  options,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  options: ReadonlyArray<readonly [string, string]>;
+}) {
+  return (
+    <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+      {label}
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-9 min-w-[10rem] rounded-lg border border-white/10 bg-black/30 px-3 text-sm text-foreground"
+      >
+        {options.map(([optionValue, optionLabel]) => (
+          <option key={optionValue || "all"} value={optionValue}>
+            {optionLabel}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
 }
 
 function QueueCard<T>({

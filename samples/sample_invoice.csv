@@ -1,0 +1,5 @@
+carrier,invoice_number,invoice_date,billing_period,account_number,currency,tracking_number,service_code,ship_date,zone,charge_code,description,amount,origin_zip,destination_zip,billed_weight_lbs,billed_length_in,billed_width_in,billed_height_in,invoice_subtotal
+UPS,INV-2026-001,2026-02-28,2026-02,A1B2C3,USD,1Z999AA10123456784,GROUND,2026-02-10,5,FRT,Freight charge,18.40,80202,59068,5,12,8,6,30.75
+UPS,INV-2026-001,2026-02-28,2026-02,A1B2C3,USD,1Z999AA10123456784,GROUND,2026-02-10,5,FUEL,Fuel surcharge,2.90,80202,59068,5,12,8,6,
+UPS,INV-2026-001,2026-02-28,2026-02,A1B2C3,USD,1Z999AA10123456784,GROUND,2026-02-10,5,RES,Residential surcharge,5.25,80202,59068,5,12,8,6,
+UPS,INV-2026-001,2026-02-28,2026-02,A1B2C3,USD,1Z999AA10123456784,GROUND,2026-02-10,5,DAS,Delivery area surcharge,4.20,80202,59068,5,12,8,6,
